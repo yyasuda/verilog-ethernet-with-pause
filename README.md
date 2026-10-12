@@ -62,10 +62,10 @@ The following measurements show 40,000 1500-byte frames from J10A to J10B with I
 
 | XOFF interval | Completion time | Received | Missing | Payload mismatch |
 |---|---:|---:|---:|---:|
-| None | 0.51398 s | 40,000 | 0 | 0 |
+| None   | 0.51398 s | 40,000 | 0 | 0 |
 | 100 ms | 0.85802 s | 40,000 | 0 | 0 |
-| 75 ms | 1.183999 s | 40,000 | 0 | 0 |
-| 50 ms | 1.99899 s | 40,000 | 0 | 0 |
+| 75 ms  | 1.18399 s | 40,000 | 0 | 0 |
+| 50 ms  | 1.99899 s | 40,000 | 0 | 0 |
 
 The host I350 NIC sends XOFF toward the directly connected KR260 J10B port at the specified interval. As the interval is shortened, XOFF is also sent from the KR260 J10A port to the other host I350 port. The resulting transfer time for 40,000 packets increases.
 
