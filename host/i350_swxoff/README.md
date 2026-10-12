@@ -1,5 +1,7 @@
 # Intel I350 SWXOFF reference driver
 
+[日本語版](README.ja.md)
+
 This directory contains reference material for the temporary `igb` experiment used with the KR260 PAUSE bridge. It is not a general-purpose driver, installer, or supported kernel module.
 
 ## Purpose
@@ -8,11 +10,13 @@ The patch adds a target-limited debugfs control that writes the Intel I350 `TCTL
 
 ## Target and source
 
-- Intel I350 `8086:1521`, target BDF `0000:43:00.1` (`j10b`)
+- Intel I350 `8086:1521`, target BDF `0000:43:00.1` (`j10b`). Here, `j10a`/`j10b` mean the host Ethernet interfaces directly connected to KR260 J10A/J10B.
 - Ubuntu `6.8.0-138-generic`
 - Canonical `linux-hwe-6.8` source package `6.8.0-138.138~22.04.1`
 - Build against the matching `/lib/modules/6.8.0-138-generic/build`
 - Verified module SHA-256: `ae1d52b112fd250e2f1a06b887b8f9674be6cb50b1b9df5b872d2a7fdde587ab`
+
+Use a built `igb_swxoff.ko` only after verifying its SHA-256, vermagic, and target kernel version.
 
 The patch order is:
 
@@ -34,8 +38,6 @@ Prepare the source directory by copying the complete `igb` directory from the ma
 
 The binary `.ko`, kernel source tree, and build intermediates are intentionally not included.
 
-`P4FAB_J10B_DISABLE_PAUSE` exists in the copied wrapper only as a historical diagnostic macro. Normal builds leave it undefined, so PAUSE remains enabled; this reference driver does not control FPGA PAUSE enablement.
-
 ## Debugfs ABI
 
 ```bash
@@ -53,6 +55,21 @@ sudo cat "$STATUS"
 
 The periodic worker has a 30-second absolute deadline. At `FCTTV=0xffff` and 1 Gb/s, one XOFF represents approximately 33.55 ms of PAUSE time. The 100/75/50 ms values are experimental stop/resume conditions, not hardware configuration values.
 
+## Temporary driver replacement
+
+```bash
+sudo modprobe -r igb
+sudo insmod /path/to/igb_swxoff.ko
+lspci -nnk -s 43:00.1
+ethtool j10b
+```
+
+Confirm that `j10b` is bound to the target BDF and reports `1000Mb/s`, `Full`, and `Link detected: yes` before using debugfs. After a single XOFF, check that `requests`, `register_triggers`, and `tx_flow_control_xoff` increased and that `last_error=0`.
+
+```bash
+ethtool -S j10b | grep -E 'flow_control_xoff|flow_control_xon'
+```
+
 ## Safety and recovery
 
 Root permission and temporary stock-driver replacement are required. All functions bound to the experimental module are affected during unload/reload; use an independent management path and verify link/binding before sending traffic. The module is restricted to the target BDF for SWXOFF control.
@@ -63,6 +80,16 @@ sudo modprobe igb
 ```
 
 Verify both PCI bindings, link state, PAUSE settings, and removal of the debugfs directory after recovery. This material does not install into initramfs or autoload configuration.
+
+Example recovery checks:
+
+```bash
+lspci -nnk -s 43:00.0
+lspci -nnk -s 43:00.1
+ethtool j10a
+ethtool j10b
+test ! -e /sys/kernel/debug/igb_swxoff-0000:43:00.1/status
+```
 
 ## Evidence
 
