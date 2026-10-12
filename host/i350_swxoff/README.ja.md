@@ -10,7 +10,7 @@
 
 ## 対象と source
 
-- Intel I350 `8086:1521`、対象 BDF `0000:43:00.1`（`j10b`）
+- Intel I350 `8086:1521`、対象 BDF `0000:43:00.1`（`j10b`）。ここでの `j10a`/`j10b` は、KR260 の J10A/J10B に直接接続された host 側 Ethernet interface を意味します。
 - Ubuntu `6.8.0-138-generic`
 - Canonical `linux-hwe-6.8` source package `6.8.0-138.138~22.04.1`
 - 対応する `/lib/modules/6.8.0-138-generic/build` に対して build
