@@ -67,9 +67,11 @@ module p4fab_verilog_ethernet_rgmii_wrapper #(
     .phy_rgmii_tx_clk(rgmii_txc_raw), .phy_rgmii_txd(rgmii_txd_phyif),
     .phy_rgmii_tx_ctl(rgmii_tx_ctl_phyif), .speed(2'b10));
 
-  // 05e-3f diagnostic build can remove only the upstream MAC PAUSE datapath.
-  // The production default remains enabled; the endpoint, TX frame store,
-  // clocks, resets, and physical I/O are unchanged in either build.
+  // P4FAB_J10B_DISABLE_PAUSE is a historical diagnostic-only macro.
+  // It is normally undefined, so the J10B MAC PAUSE datapath remains enabled.
+  // The I350 SWXOFF reference driver does not control this FPGA-side setting.
+  // The endpoint, TX frame store, clocks, resets, and physical I/O are
+  // unchanged in either build.
 `ifdef P4FAB_J10B_DISABLE_PAUSE
   localparam J10B_PAUSE_ENABLE = 0;
 `else

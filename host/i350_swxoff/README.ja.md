@@ -38,7 +38,7 @@ igb_swxoff-objs := igb_main.o igb_ethtool.o e1000_82575.o \\
 
 binary `.ko`、kernel source tree、build intermediate は意図的に含めていません。
 
-コピーした wrapper にある `P4FAB_J10B_DISABLE_PAUSE` は、過去の診断用 macro に過ぎません。通常 build では未定義のため PAUSE は有効なままです。この参照 driver は FPGA 側の PAUSE enable を制御しません。
+公開 repository の `rtl/p4fab_verilog_ethernet_rgmii_wrapper_05e4a.sv` にある `P4FAB_J10B_DISABLE_PAUSE` は、過去の診断用 macro に過ぎません。通常 build では未定義のため PAUSE は有効なままです。この参照 driver は FPGA 側の PAUSE enable を制御しません。詳細は wrapper のコメントを参照してください。
 
 ## debugfs ABI
 
