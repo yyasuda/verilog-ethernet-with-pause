@@ -3,7 +3,7 @@
 [English version](README.md)
 
 このリポジトリは、[verilog-ethernet](https://github.com/alexforencich/verilog-ethernet) にPAUSE機能を追加した実験用 source example です。
-verilog-ethernetには10G PHY向けのPAUSE実装しか無く、AMD KR260ボードの1GポートでPAUSE機能を実現するために作成し、動作を確認したものです。
+upstream verilog-ethernet の PAUSE control RTL を 1GbE RGMII MAC に統合し、AMD KR260 の 1GbE ポートで使用できるようにした実験用 source example です。
 
 ## アーキテクチャ
 
