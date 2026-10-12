@@ -3,73 +3,59 @@
 ## Build result
 
 - Kernel headers: `6.8.0-138.138~22.04.1`
-- Compiler: Ubuntu GCC `12.3.0-1ubuntu1~22.04.3`（kernel buildと同一version）
-- `make ... W=1 modules`: PASS、compiler/modpost warningなし
-- BTF: `vmlinux`不在のためskip。module load可否には影響しない。
-- module name: `igb_swxoff`
+- Compiler: Ubuntu GCC `12.3.0-1ubuntu1~22.04.3` (same version as the kernel build)
+- `make ... W=1 modules`: PASS, with no compiler or modpost warnings
+- BTF: skipped because `vmlinux` was unavailable; this does not affect module loading
+- Module name: `igb_swxoff`
 - vermagic: `6.8.0-138-generic SMP preempt mod_unload modversions`
-- `CONFIG_IGB=m`、`CONFIG_DEBUG_FS=y`
-- Secure Boot: disabled、Platform Setup Mode
+- `CONFIG_IGB=m`, `CONFIG_DEBUG_FS=y`
+- Secure Boot: disabled, Platform Setup Mode
 
-成果物：
+Artifacts:
 
 ```text
 b215b2b6767e60082c3651dbda13277b14e5b7879a7fae12e8edc08e75c100ca  [historical verified module; binary not included]
 b41cbf352f70a1b7a68d6a9277f877f3db6a065bd0bea34331dd085128b69a5d  igb_swxoff.patch
 ```
 
-`checkpatch.pl --strict --no-tree --no-signoff`: 0 errors、0 warnings、0 checks。
-patchはCanonical source treeに対する`patch --dry-run -p1`がPASSした。
+`checkpatch.pl --strict --no-tree --no-signoff`: 0 errors, 0 warnings, 0 checks. `patch --dry-run -p1` against the Canonical source tree passed.
 
 ## Lifecycle audit
 
 ### MMIO serialization
 
-SWXOFF MMIOはdelayed workerだけが行う。workerはRTNLを取得してから
-`swxoff_lock`を取得する。通常のopen/close、ethtool reconfiguration、MTU/ring変更、
-reset workとの関係ではRTNLが最外周のserializationとなる。
+Only the delayed worker performs SWXOFF MMIO. The worker acquires RTNL before `swxoff_lock`. RTNL is the outer serialization for normal open/close, ethtool reconfiguration, MTU/ring changes, and reset work.
 
-`igb_down()`冒頭では`__IGB_DOWN`設定後に`swxoff_lock`を取得してperiodic/once状態を
-idle化する。そのため、workerが既にlock内ならSWXOFF write完了後にdownが進み、downが
-先ならworkerは`__IGB_DOWN`を検出して書かない。
+At the start of `igb_down()`, `__IGB_DOWN` is set and then `swxoff_lock` is acquired to make periodic/once state idle. If the worker already holds the lock, down proceeds after the SWXOFF write; if down runs first, the worker detects `__IGB_DOWN` and does not write.
 
-PCI AER `igb_io_error_detected()`はRTNLなしで`igb_down()`を呼び得る。この経路でも
-`swxoff_lock`がworkerのMMIO区間とdownを直列化し、`netif_device_detach()`と
-`__IGB_DOWN` guardも作用する。
+PCI AER `igb_io_error_detected()` may call `igb_down()` without RTNL. This path also serializes down with the worker's MMIO interval using `swxoff_lock`; `netif_device_detach()` and the `__IGB_DOWN` guard apply as well.
 
 ### Cancel deadlock prevention
 
-`igb_down()`は`cancel_delayed_work()`のみを呼ぶ。workerがRTNL待ちの状態で、RTNLを
-保持したdown側が同期cancelして相互待ちになる経路はない。
+`igb_down()` calls only `cancel_delayed_work()`. There is no path where down holds RTNL, synchronously cancels a worker waiting for RTNL, and deadlocks.
 
-debugfs `stop`はcommand lockで他commandを排除し、state lock内でidle化してからlockを
-すべて解放し、その後`cancel_delayed_work_sync()`する。workerはcommand lockを取得しない。
+debugfs `stop` excludes other commands with the command lock, makes the state idle under the state lock, releases all locks, and then calls `cancel_delayed_work_sync()`. The worker does not acquire the command lock.
 
-removeはdebugfs removal後にremoving/idleを設定し、RTNLもstate lockも保持しない状態で
-同期cancelする。その完了後に既存igb remove処理がBAR unmapとadapter freeへ進むため、
-unmap/free後にworkerは残らない。通常の`debugfs_create_file()`を使用しており、debugfs coreの
-file-removal protectionも有効である。
+remove sets removing/idle after debugfs removal and synchronously cancels without holding RTNL or the state lock. Only after completion does the existing igb remove path unmap BARs and free the adapter, so no worker remains after unmap/free. The implementation uses normal `debugfs_create_file()` and benefits from debugfs core file-removal protection.
 
 ### Command races and deadline
 
-- `swxoff_command_lock`: `once`、`periodic`、`stop`のwrite全体を直列化する。
-- `swxoff_lock`: mode、deadline、counter、remove stateとSWXOFF MMIOを保護する。
-- active中の新しい`once`/`periodic`は`-EBUSY`。開始時刻/deadlineを上書きしない。
-- 30秒deadlineは`periodic`受理時に一度だけ設定する。
-- 各workerは送信前と再schedule前の両方で絶対deadlineを確認する。
-- 最後のdelayは`min(interval, deadline - jiffies)`なので、deadlineに状態を停止へ遷移する
-  workerは動くが、deadline以後のSWXOFF writeは行わない。
-- link/down/reset等の失敗は周期動作を停止する。`SWXOFF`未self-clearの`-EBUSY`だけは
-  deadline内で再試行する。
+- `swxoff_command_lock`: serializes the complete write of `once`, `periodic`, and `stop`.
+- `swxoff_lock`: protects mode, deadline, counters, remove state, and SWXOFF MMIO.
+- New `once`/`periodic` commands while active return `-EBUSY`; start time and deadline are not overwritten.
+- The 30-second deadline is set once when `periodic` is accepted.
+- Each worker checks the absolute deadline both before transmission and before rescheduling.
+- The final delay is `min(interval, deadline - jiffies)`, so no SWXOFF write occurs after the deadline.
+- Link/down/reset failures stop periodic operation. Only `-EBUSY` from SWXOFF not self-clearing is retried within the deadline.
 
 ## Deliberately not verified yet
 
-- module unload/loadとPCI rebind
-- debugfs entryの実機生成
+- Module unload/load and PCI rebind
+- Runtime creation of the debugfs entry
 - `TCTL.SWXOFF` write/self-clear
 - XOFF frame wire transmission
-- `tx_flow_control_xoff`増加
-- KR260側PAUSE受信・送信抑制
-- stop後の自然満了と30秒自動停止のruntime挙動
+- Increase of `tx_flow_control_xoff`
+- KR260-side PAUSE reception and TX suppression
+- Runtime behavior of natural timer expiry after stop and the 30-second automatic stop
 
-これらはNIC状態変更を伴う次工程として、明示承認後に実施する。
+These require NIC state changes and are deferred to a subsequent explicitly approved phase.
