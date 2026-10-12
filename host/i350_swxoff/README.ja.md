@@ -16,6 +16,8 @@
 - 対応する `/lib/modules/6.8.0-138-generic/build` に対して build
 - 検証済み module SHA-256: `ae1d52b112fd250e2f1a06b887b8f9674be6cb50b1b9df5b872d2a7fdde587ab`
 
+生成した `igb_swxoff.ko` は、SHA-256、vermagic、対象 kernel version が一致することを確認してから使用します。
+
 patch の適用順序：
 
 1. Canonical の `drivers/net/ethernet/intel/igb` source tree に `igb_swxoff.patch` を適用する。
@@ -55,6 +57,23 @@ sudo cat "$STATUS"
 
 周期 worker には30秒の絶対 deadline があります。`FCTTV=0xffff`、1 Gb/s では、1回の XOFF は約33.55 ms の PAUSE time に相当します。100/75/50 ms は実験上の停止・再開条件であり、hardware configuration value ではありません。
 
+## driver の一時交換
+
+```bash
+sudo modprobe -r igb
+sudo insmod /path/to/igb_swxoff.ko
+lspci -nnk -s 43:00.1
+ethtool j10b
+```
+
+`j10b` が対象 BDF に bind され、`1000Mb/s`、`Full`、`Link detected: yes` であることを確認してから debugfs を操作します。
+
+単発 XOFF 後は `requests`、`register_triggers`、`tx_flow_control_xoff` の増加と `last_error=0` を確認します。
+
+```bash
+ethtool -S j10b | grep -E 'flow_control_xoff|flow_control_xon'
+```
+
 ## 安全性と復元
 
 root 権限と一時的な stock driver 交換が必要です。実験 module の unload/reload 中は、その module に bind された全 function が影響を受けます。独立した管理経路を使用し、traffic 送信前に link と binding を確認してください。SWXOFF control の対象は対象 BDF に限定されています。
@@ -65,6 +84,16 @@ sudo modprobe igb
 ```
 
 両 PCI function の binding、link state、PAUSE 設定、復元後の debugfs directory 消滅を確認してください。この資料は initramfs や autoload configuration へ install しません。
+
+復元確認例：
+
+```bash
+lspci -nnk -s 43:00.0
+lspci -nnk -s 43:00.1
+ethtool j10a
+ethtool j10b
+test ! -e /sys/kernel/debug/igb_swxoff-0000:43:00.1/status
+```
 
 ## Evidence
 
