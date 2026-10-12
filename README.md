@@ -2,22 +2,20 @@
 
 [日本語版](README.ja.md)
 
-Proposed repository: `verilog-ethernet-with-pause`  
-GitHub description: `IEEE 802.3x PAUSE flow-control example using verilog-ethernet on AMD Kria KR260.`
-
-This directory is an independent, experimental source example extracted from the 05e-4a minimal cross-connect validation. It is not the RC2 repository, a product, or a turnkey KR260 distribution.
+This repository is an experimental source example that adds PAUSE handling to [verilog-ethernet](https://github.com/alexforencich/verilog-ethernet). The upstream PAUSE control RTL is integrated with the 1GbE MAC for use on the AMD Kria KR260 1GbE ports; the implementation has been verified on the target hardware image.
 
 ## Architecture
 
 ```text
 J10A DP83867/RGMII
-  -> verilog-ethernet MAC + PAUSE RX/TX + RX frame store
-  -> static_dual_crossconnect
-  -> TX frame store + verilog-ethernet MAC + PAUSE RX/TX
+  -> verilog-ethernet MAC + PAUSE RX/TX
+  -> J10A RX frame buffer (32 frames)
+  -> J10B TX frame buffer (3 frames)
+  -> verilog-ethernet MAC + PAUSE RX/TX
   -> J10B DP83867/RGMII
 ```
 
-The reverse path is symmetric. PAUSE RX/TX is compile-time enabled on both ports; the validated watermark, quanta, and refresh settings are retained. PAUSE frames are consumed by the MAC control path and are not forwarded as ordinary data.
+The reverse path from J10B to J10A has the same structure. Each RX frame buffer is directly connected through AXI4-Stream to the TX frame buffer of the opposite port, so packets entering one port are output from the opposite port.
 
 ## Contents
 
@@ -31,9 +29,9 @@ The reverse path is symmetric. PAUSE RX/TX is compile-time enabled on both ports
 
 ## Build boundary
 
-This is source-only example material. A complete Vivado top still requires a board-specific PS/clock/MDIO wrapper and generated platform IP. Those platform files are intentionally not included here because the 05e production top contains VNP4 and RC2-specific interfaces. No VNP4, P4, GEM2 packet datapath, generated IP, bitstream, XSA, BootFW, FIT, or DTB is included.
+This is source-only example material. A complete Vivado top still requires a board-specific PS/clock/MDIO wrapper and generated platform IP. Bitstream, XSA, BootFW, FIT, and DTB files are not included.
 
-The added PL file is source-only and not hardware-qualified by itself. Its static elaboration requires the two documented platform modules, `axis_clock_converter`, AMD RGMII primitives, and XPM CDC definitions. The platform endpoint module must reproduce the validated 05e endpoint connection; no new datapath or PAUSE logic is defined here.
+The added PL file is source-only and not hardware-qualified by itself. Its static elaboration requires the two documented platform modules, `axis_clock_converter`, AMD RGMII primitives, and XPM CDC definitions.
 
 The `j10a_phy_mdio` and `j10b_phy_mdio` ports in the PL top are only an integration boundary. The shown assignments are not a completed bidirectional MDIO implementation; the platform wrapper must provide the actual I/O buffers, tri-state direction, and Clause-22 MDIO masters.
 
@@ -48,6 +46,8 @@ Use Vivado 2026.1, the KR260 carrier 2.0 pinout, and the verilog-ethernet source
 
 ## Forwarding test
 
+The test setup directly connects the KR260 J10A and J10B ports to the host Ubuntu PC's `j10a` and `j10b` network interfaces.
+
 ```text
 sudo python3 host/runtime_forward.py j10a j10b --count 40000 --length 1500 --rcvbuf 16777216
 ```
@@ -56,7 +56,9 @@ The receiver runs concurrently with the sender and validates frame count, arriva
 
 ## Measured PAUSE demonstration
 
-The following measurements were obtained on the validated runtime image, with 40,000 1500-byte frames from J10A to J10B and I350 j10b software XOFF:
+The PAUSE behavior was tested using the I350 driver patched for the experiment under `host/i350_swxoff/`; see [host/i350_swxoff/README.md](host/i350_swxoff/README.md).
+
+The following measurements show 40,000 1500-byte frames from J10A to J10B with I350 j10b software XOFF:
 
 | XOFF interval | Completion time | Received | Missing | Payload mismatch |
 |---|---:|---:|---:|---:|
@@ -65,7 +67,9 @@ The following measurements were obtained on the validated runtime image, with 40
 | 75 ms | 1.183999 s | 40,000 | 0 | 0 |
 | 50 ms | 1.99899 s | 40,000 | 0 | 0 |
 
-These are measurements of one validated hardware image, not a general performance guarantee, and are not a hardware-validation result for this published source-only top. The raw record and counter context are in `host/pause_completion_benchmark_20261012.md`. The 25 ms and 16 ms conditions failed and are not presented as successful points.
+The host I350 NIC sends XOFF toward the directly connected KR260 J10B port at the specified interval. As the interval is shortened, XOFF is also sent from the KR260 J10A port to the other host I350 port. The resulting transfer time for 40,000 packets increases.
+
+These are measurements of one validated hardware image, not a general performance guarantee, and are not a hardware-validation result for this published source-only top. The raw record and counter context are in `host/pause_completion_benchmark_20261012.md`.
 
 ```mermaid
 xychart-beta
