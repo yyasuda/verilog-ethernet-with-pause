@@ -1,0 +1,39 @@
+I350 periodic SWXOFF -> KR260 static cross-connect PAUSE propagation
+date: 2026-10-12 JST
+runtime_image_sha256: c6e7382d59820537f94b61c6291fd2fec149226eb26022ffa5242e59ba724164
+module_sha256: ae1d52b112fd250e2f1a06b887b8f9674be6cb50b1b9df5b872d2a7fdde587ab
+kernel: 6.8.0-138-generic
+pci_bdf: 0000:43:00.1
+
+Preflight:
+  FPGA Manager operating
+  eth0 UP (management), eth1/eth2 DOWN
+  j10a/j10b 1000 Mb/s full-duplex, link detected
+  experimental module loaded and debugfs status valid
+
+Valid propagation run:
+  traffic: continuous j10a -> j10b, 1500-byte frames
+  sender result: 324438 frames sent in 8 seconds
+  command: periodic 16
+  active interval: approximately 4 seconds, then stop
+  status after stop: mode=stopped, interval_ms=16, timed_out=0, last_error=0
+  requests/register_triggers total after two short runs: 474/474
+  valid-run j10b tx_flow_control_xoff delta: +237
+  valid-run j10a rx_flow_control_xoff delta: +246776
+  valid-run j10a rx_flow_control_xon delta: +5
+  valid-run j10a tx_packets delta: +324457
+  valid-run j10b rx_packets delta: +324448
+  valid-run j10a/j10b CRC/frame/errors: no increase (0)
+
+Interpretation:
+  j10b periodic XOFF was transmitted (hardware counter increased).
+  Under continuous forwarding load, j10a received a large number of XOFFs,
+  consistent with KR260 upstream PAUSE propagation after downstream stall.
+  This is an observation; internal FPGA occupancy was not directly read back.
+
+Recovery:
+  after stop and timer wait, j10a -> j10b and j10b -> j10a exact frame matrix
+  (64/80/800/1500/1514 bytes) passed.
+  stock igb reload: PASS; debugfs removed; both links recovered 1000/full.
+
+No FPGA image, RTL, constraints, or PS/GEM2 configuration was changed.

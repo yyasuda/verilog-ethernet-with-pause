@@ -1,0 +1,386 @@
+Subject: [EXPERIMENTAL] igb: add target-limited I350 SWXOFF debugfs control
+
+Add software-initiated PAUSE XOFF injection for I350 0000:43:00.1 only.
+Provide once, bounded periodic, stop, and status operations without
+changing FCTTV or implementing software XON.
+
+---
+
+--- a/drivers/net/ethernet/intel/igb/e1000_defines.h
++++ b/drivers/net/ethernet/intel/igb/e1000_defines.h
+@@ -306,6 +306,7 @@
+ #define E1000_TCTL_PSP    0x00000008    /* pad short packets */
+ #define E1000_TCTL_CT     0x00000ff0    /* collision threshold */
+ #define E1000_TCTL_COLD   0x003ff000    /* collision distance */
++#define E1000_TCTL_SWXOFF 0x00400000    /* software XOFF transmission */
+ #define E1000_TCTL_RTLC   0x01000000    /* Re-transmit on late collision */
+ 
+ /* DMA Coalescing register fields */
+--- a/drivers/net/ethernet/intel/igb/igb.h
++++ b/drivers/net/ethernet/intel/igb/igb.h
+@@ -577,6 +577,19 @@
+ 
+ 	struct work_struct reset_task;
+ 	struct work_struct watchdog_task;
++	struct delayed_work swxoff_work;
++	struct mutex swxoff_command_lock; /* serialize debugfs commands */
++	struct mutex swxoff_lock; /* protect state and SWXOFF MMIO */
++	struct dentry *swxoff_debugfs_dir;
++	unsigned long swxoff_deadline;
++	u32 swxoff_interval_ms;
++	u64 swxoff_requests;
++	u64 swxoff_triggers;
++	int swxoff_last_error;
++	u8 swxoff_mode;
++	bool swxoff_target;
++	bool swxoff_removing;
++	bool swxoff_timed_out;
+ 	bool fc_autoneg;
+ 	u8  tx_timeout_factor;
+ 	struct timer_list blink_timer;
+--- a/drivers/net/ethernet/intel/igb/igb_main.c
++++ b/drivers/net/ethernet/intel/igb/igb_main.c
+@@ -34,6 +34,8 @@
+ #include <linux/pm_runtime.h>
+ #include <linux/etherdevice.h>
+ #include <linux/lockdep.h>
++#include <linux/debugfs.h>
++#include <linux/seq_file.h>
+ #ifdef CONFIG_IGB_DCA
+ #include <linux/dca.h>
+ #endif
+@@ -220,6 +222,302 @@
+ 
+ static void igb_init_dmac(struct igb_adapter *adapter, u32 pba);
+ 
++#define IGB_SWXOFF_DOMAIN	0
++#define IGB_SWXOFF_BUS		0x43
++#define IGB_SWXOFF_SLOT		0x00
++#define IGB_SWXOFF_FUNC		0x01
++#define IGB_SWXOFF_MAX_MS	30000U
++
++enum igb_swxoff_mode {
++	IGB_SWXOFF_IDLE,
++	IGB_SWXOFF_ONCE,
++	IGB_SWXOFF_PERIODIC,
++};
++
++static bool igb_swxoff_is_target(struct pci_dev *pdev)
++{
++	return pdev->vendor == PCI_VENDOR_ID_INTEL &&
++	       pdev->device == E1000_DEV_ID_I350_COPPER &&
++	       pci_domain_nr(pdev->bus) == IGB_SWXOFF_DOMAIN &&
++	       pdev->bus->number == IGB_SWXOFF_BUS &&
++	       PCI_SLOT(pdev->devfn) == IGB_SWXOFF_SLOT &&
++	       PCI_FUNC(pdev->devfn) == IGB_SWXOFF_FUNC;
++}
++
++/* Worker holds RTNL and adapter->swxoff_lock, in that order. */
++static int igb_swxoff_trigger_locked(struct igb_adapter *adapter)
++{
++	struct e1000_hw *hw = &adapter->hw;
++	u32 tctl;
++
++	lockdep_assert_held(&adapter->swxoff_lock);
++
++	if (adapter->swxoff_removing ||
++	    test_bit(__IGB_DOWN, &adapter->state) ||
++	    test_bit(__IGB_RESETTING, &adapter->state) ||
++	    !netif_device_present(adapter->netdev) ||
++	    !netif_running(adapter->netdev))
++		return -ENETDOWN;
++	if (!netif_carrier_ok(adapter->netdev))
++		return -ENOLINK;
++	if (adapter->link_duplex != FULL_DUPLEX)
++		return -EPROTONOSUPPORT;
++
++	tctl = rd32(E1000_TCTL);
++	if (!(tctl & E1000_TCTL_EN))
++		return -EIO;
++	if (tctl & E1000_TCTL_SWXOFF)
++		return -EBUSY;
++
++	wr32(E1000_TCTL, tctl | E1000_TCTL_SWXOFF);
++	wrfl();
++	return 0;
++}
++
++static void igb_swxoff_work(struct work_struct *work)
++{
++	struct igb_adapter *adapter =
++		container_of(to_delayed_work(work), struct igb_adapter,
++			     swxoff_work);
++	unsigned long delay, remaining;
++	int err = 0;
++
++	/* Lock order is RTNL -> swxoff_lock. */
++	rtnl_lock();
++	mutex_lock(&adapter->swxoff_lock);
++
++	if (adapter->swxoff_mode == IGB_SWXOFF_IDLE ||
++	    adapter->swxoff_removing)
++		goto out;
++
++	if (adapter->swxoff_mode == IGB_SWXOFF_PERIODIC &&
++	    time_after_eq(jiffies, adapter->swxoff_deadline)) {
++		adapter->swxoff_mode = IGB_SWXOFF_IDLE;
++		adapter->swxoff_timed_out = true;
++		goto out;
++	}
++
++	adapter->swxoff_requests++;
++	err = igb_swxoff_trigger_locked(adapter);
++	adapter->swxoff_last_error = err;
++	if (!err)
++		adapter->swxoff_triggers++;
++
++	if (adapter->swxoff_mode == IGB_SWXOFF_ONCE) {
++		adapter->swxoff_mode = IGB_SWXOFF_IDLE;
++		goto out;
++	}
++
++	/* A state or link failure terminates periodic injection safely. */
++	if (err && err != -EBUSY) {
++		adapter->swxoff_mode = IGB_SWXOFF_IDLE;
++		goto out;
++	}
++	if (time_after_eq(jiffies, adapter->swxoff_deadline)) {
++		adapter->swxoff_mode = IGB_SWXOFF_IDLE;
++		adapter->swxoff_timed_out = true;
++		goto out;
++	}
++
++	delay = msecs_to_jiffies(adapter->swxoff_interval_ms);
++	remaining = adapter->swxoff_deadline - jiffies;
++	if (delay > remaining)
++		delay = remaining;
++	mod_delayed_work(system_wq, &adapter->swxoff_work, delay);
++out:
++	mutex_unlock(&adapter->swxoff_lock);
++	rtnl_unlock();
++}
++
++/* Called by every igb_down() path, including PCI AER paths without RTNL.
++ * Never synchronously wait here: a queued worker can be waiting for RTNL.
++ */
++static void igb_swxoff_quiesce_down(struct igb_adapter *adapter)
++{
++	if (!adapter->swxoff_target)
++		return;
++
++	mutex_lock(&adapter->swxoff_lock);
++	adapter->swxoff_mode = IGB_SWXOFF_IDLE;
++	cancel_delayed_work(&adapter->swxoff_work);
++	mutex_unlock(&adapter->swxoff_lock);
++}
++
++static int igb_swxoff_status_show(struct seq_file *m, void *unused)
++{
++	struct igb_adapter *adapter = m->private;
++	unsigned long remaining_ms = 0;
++	const char *mode;
++
++	mutex_lock(&adapter->swxoff_lock);
++	switch (adapter->swxoff_mode) {
++	case IGB_SWXOFF_ONCE:
++		mode = "once";
++		break;
++	case IGB_SWXOFF_PERIODIC:
++		mode = "periodic";
++		if (time_before(jiffies, adapter->swxoff_deadline))
++			remaining_ms = jiffies_to_msecs(adapter->swxoff_deadline -
++						       jiffies);
++		break;
++	default:
++		mode = "stopped";
++		break;
++	}
++	seq_printf(m, "target=%s\n", pci_name(adapter->pdev));
++	seq_printf(m, "netdev=%s\n", adapter->netdev->name);
++	seq_printf(m, "mode=%s\n", mode);
++	seq_printf(m, "interval_ms=%u\n", adapter->swxoff_interval_ms);
++	seq_printf(m, "remaining_ms=%lu\n", remaining_ms);
++	seq_printf(m, "timed_out=%u\n", adapter->swxoff_timed_out);
++	seq_printf(m, "requests=%llu\n",
++		   (unsigned long long)adapter->swxoff_requests);
++	seq_printf(m, "register_triggers=%llu\n",
++		   (unsigned long long)adapter->swxoff_triggers);
++	seq_printf(m, "last_error=%d\n", adapter->swxoff_last_error);
++	mutex_unlock(&adapter->swxoff_lock);
++	return 0;
++}
++
++static int igb_swxoff_status_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, igb_swxoff_status_show, inode->i_private);
++}
++
++static const struct file_operations igb_swxoff_status_fops = {
++	.owner = THIS_MODULE,
++	.open = igb_swxoff_status_open,
++	.read = seq_read,
++	.llseek = seq_lseek,
++	.release = single_release,
++};
++
++static ssize_t igb_swxoff_control_write(struct file *file,
++					const char __user *user_buf,
++					size_t count, loff_t *ppos)
++{
++	struct igb_adapter *adapter = file->private_data;
++	unsigned int interval_ms;
++	char buf[32];
++	int n, err = 0;
++
++	if (!count || count >= sizeof(buf))
++		return -EINVAL;
++	if (copy_from_user(buf, user_buf, count))
++		return -EFAULT;
++	buf[count] = '\0';
++	strim(buf);
++
++	mutex_lock(&adapter->swxoff_command_lock);
++	if (!strcmp(buf, "stop")) {
++		mutex_lock(&adapter->swxoff_lock);
++		adapter->swxoff_mode = IGB_SWXOFF_IDLE;
++		adapter->swxoff_timed_out = false;
++		mutex_unlock(&adapter->swxoff_lock);
++		/* No RTNL or swxoff_lock is held across synchronous cancel. */
++		cancel_delayed_work_sync(&adapter->swxoff_work);
++	} else if (!strcmp(buf, "once")) {
++		mutex_lock(&adapter->swxoff_lock);
++		if (adapter->swxoff_removing) {
++			err = -ENODEV;
++		} else if (adapter->swxoff_mode != IGB_SWXOFF_IDLE) {
++			err = -EBUSY;
++		} else {
++			adapter->swxoff_mode = IGB_SWXOFF_ONCE;
++			adapter->swxoff_timed_out = false;
++			adapter->swxoff_last_error = 0;
++			mod_delayed_work(system_wq, &adapter->swxoff_work, 0);
++		}
++		mutex_unlock(&adapter->swxoff_lock);
++	} else if (sscanf(buf, "periodic %u%n", &interval_ms, &n) == 1 &&
++		   buf[n] == '\0') {
++		if (!interval_ms || interval_ms >= IGB_SWXOFF_MAX_MS) {
++			err = -ERANGE;
++		} else {
++			mutex_lock(&adapter->swxoff_lock);
++			if (adapter->swxoff_removing) {
++				err = -ENODEV;
++			} else if (adapter->swxoff_mode != IGB_SWXOFF_IDLE) {
++				err = -EBUSY;
++			} else {
++				adapter->swxoff_interval_ms = interval_ms;
++				adapter->swxoff_deadline =
++					jiffies + msecs_to_jiffies(IGB_SWXOFF_MAX_MS);
++				adapter->swxoff_mode = IGB_SWXOFF_PERIODIC;
++				adapter->swxoff_timed_out = false;
++				adapter->swxoff_last_error = 0;
++				mod_delayed_work(system_wq,
++						 &adapter->swxoff_work, 0);
++			}
++			mutex_unlock(&adapter->swxoff_lock);
++		}
++	} else {
++		err = -EINVAL;
++	}
++	mutex_unlock(&adapter->swxoff_command_lock);
++
++	return err ? err : count;
++}
++
++static const struct file_operations igb_swxoff_control_fops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.write = igb_swxoff_control_write,
++	.llseek = no_llseek,
++};
++
++static void igb_swxoff_debugfs_init(struct igb_adapter *adapter)
++{
++	struct dentry *control, *status;
++
++	adapter->swxoff_target = igb_swxoff_is_target(adapter->pdev);
++	if (!adapter->swxoff_target)
++		return;
++
++	mutex_init(&adapter->swxoff_command_lock);
++	mutex_init(&adapter->swxoff_lock);
++	INIT_DELAYED_WORK(&adapter->swxoff_work, igb_swxoff_work);
++	adapter->swxoff_debugfs_dir =
++		debugfs_create_dir("igb_swxoff-0000:43:00.1", NULL);
++	if (IS_ERR_OR_NULL(adapter->swxoff_debugfs_dir)) {
++		dev_warn(&adapter->pdev->dev, "SWXOFF debugfs unavailable: %ld\n",
++			 IS_ERR(adapter->swxoff_debugfs_dir) ?
++			 PTR_ERR(adapter->swxoff_debugfs_dir) : -ENODEV);
++		adapter->swxoff_debugfs_dir = NULL;
++		return;
++	}
++	control = debugfs_create_file("control", 0600,
++				      adapter->swxoff_debugfs_dir, adapter,
++				      &igb_swxoff_control_fops);
++	status = debugfs_create_file("status", 0400,
++				     adapter->swxoff_debugfs_dir, adapter,
++				     &igb_swxoff_status_fops);
++	if (IS_ERR_OR_NULL(control) || IS_ERR_OR_NULL(status)) {
++		dev_warn(&adapter->pdev->dev,
++			 "failed to create complete SWXOFF debugfs interface\n");
++		debugfs_remove_recursive(adapter->swxoff_debugfs_dir);
++		adapter->swxoff_debugfs_dir = NULL;
++	}
++}
++
++static void igb_swxoff_debugfs_exit(struct igb_adapter *adapter)
++{
++	if (!adapter->swxoff_target)
++		return;
++
++	debugfs_remove_recursive(adapter->swxoff_debugfs_dir);
++	adapter->swxoff_debugfs_dir = NULL;
++
++	mutex_lock(&adapter->swxoff_command_lock);
++	mutex_lock(&adapter->swxoff_lock);
++	adapter->swxoff_removing = true;
++	adapter->swxoff_mode = IGB_SWXOFF_IDLE;
++	mutex_unlock(&adapter->swxoff_lock);
++	/* Worker can take RTNL, so no driver lock or RTNL may be held here. */
++	cancel_delayed_work_sync(&adapter->swxoff_work);
++	mutex_unlock(&adapter->swxoff_command_lock);
++}
++
+ static struct pci_driver igb_driver = {
+ 	.name     = igb_driver_name,
+ 	.id_table = igb_pci_tbl,
+@@ -2177,6 +2475,7 @@
+ 	 * reschedule our watchdog timer
+ 	 */
+ 	set_bit(__IGB_DOWN, &adapter->state);
++	igb_swxoff_quiesce_down(adapter);
+ 
+ 	/* disable receives in the hardware */
+ 	rctl = rd32(E1000_RCTL);
+@@ -3538,6 +3837,7 @@
+ 	 * driver.
+ 	 */
+ 	igb_get_hw_control(adapter);
++	igb_swxoff_debugfs_init(adapter);
+ 
+ 	strcpy(netdev->name, "eth%d");
+ 	err = register_netdev(netdev);
+@@ -3660,6 +3960,7 @@
+ 	return 0;
+ 
+ err_register:
++	igb_swxoff_debugfs_exit(adapter);
+ 	igb_release_hw_control(adapter);
+ 	memset(&adapter->i2c_adap, 0, sizeof(adapter->i2c_adap));
+ err_eeprom:
+@@ -3880,6 +4181,7 @@
+ 	struct e1000_hw *hw = &adapter->hw;
+ 
+ 	pm_runtime_get_noresume(&pdev->dev);
++	igb_swxoff_debugfs_exit(adapter);
+ #ifdef CONFIG_IGB_HWMON
+ 	igb_sysfs_exit(adapter);
+ #endif

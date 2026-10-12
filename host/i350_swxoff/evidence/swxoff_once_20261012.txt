@@ -1,0 +1,35 @@
+I350 SWXOFF single hardware validation
+timestamp: 2026-10-12T12:40:45+09:00
+kernel: 6.8.0-138-generic
+module_sha256: ae1d52b112fd250e2f1a06b887b8f9674be6cb50b1b9df5b872d2a7fdde587ab
+module_vermagic: 6.8.0-138-generic SMP preempt mod_unload modversions
+pci_bdf: 0000:43:00.1
+interface: j10b
+
+Preflight:
+  j10a/j10b stock igb binding, 1000 Mb/s full-duplex, link detected
+  j10b PAUSE: autonegotiate on, RX on, TX on
+  j10b baseline tx_flow_control_xoff: 0
+
+Experimental module:
+  load/binding: PASS
+  j10a/j10b link after bind: 1000 Mb/s full-duplex, link detected
+  debugfs: /sys/kernel/debug/igb_swxoff-0000:43:00.1/{control,status}
+  status before: mode=stopped requests=0 register_triggers=0 last_error=0
+
+Single command:
+  command: once
+  status after: mode=stopped requests=1 register_triggers=1 last_error=0
+  tx_flow_control_xoff before: 0
+  tx_flow_control_xoff after: 1
+  tx_flow_control_xoff delta: +1
+
+Restore:
+  igb_swxoff unload: PASS
+  stock igb reload: PASS
+  debugfs removed: PASS
+  j10a/j10b stock binding: PASS
+  j10a/j10b link after recovery: 1000 Mb/s full-duplex, link detected
+  j10b rx_crc_errors/rx_errors/tx_errors/rx_frame_errors: 0/0/0/0
+
+Periodic XOFF and KR260 PAUSE propagation were not run in this record.

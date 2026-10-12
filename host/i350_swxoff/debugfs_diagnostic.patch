@@ -1,0 +1,17 @@
+--- a/drivers/net/ethernet/intel/igb/igb_main.c
++++ b/drivers/net/ethernet/intel/igb/igb_main.c
+@@
+-static void igb_swxoff_debugfs_init(struct igb_adapter *adapter)
++static int igb_swxoff_debugfs_init(struct igb_adapter *adapter)
+@@
+-		dev_warn(&adapter->pdev->dev, "SWXOFF debugfs unavailable: %ld\\n",
++		dev_err(&adapter->pdev->dev, "SWXOFF debugfs unavailable: %ld\\n",
+@@
++	dev_info(&adapter->pdev->dev, "SWXOFF debugfs ready at %s\\n",
++		 pci_name(adapter->pdev));
++	return 0;
+@@
+-	igb_swxoff_debugfs_init(adapter);
++	err = igb_swxoff_debugfs_init(adapter);
++	if (err)
++		goto err_register;

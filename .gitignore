@@ -1,0 +1,13 @@
+build/
+.Xil/
+*.xpr
+*.xpr.user
+*.runs/
+*.cache/
+*.gen/
+*.bit
+*.bit.bin
+*.dcp
+*.xsa
+*.ltx
+__pycache__/
